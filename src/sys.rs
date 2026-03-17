@@ -58,6 +58,15 @@ pub const IFBAF_STICKY: u8 = 0x02;
 // ---- Raw kernel structures ----
 //
 // All structs use #[repr(C, packed(4))] to match xnu's `#pragma pack(4)`.
+// Sizes verified against the C compiler on macOS (see struct_sizes test).
+//
+// Expose sizes as u32 constants because the kernel's len fields are u32,
+// and this avoids usize-to-u32 casts at every call site.
+
+pub const IFBREQ_SIZE: u32 = 80;
+pub const IFBAREQ_SIZE: u32 = 36;
+pub const IFBIFCONF_SIZE: u32 = 12;
+pub const IFBACONF_SIZE: u32 = 12;
 // Sizes verified against the C compiler on macOS (see C validation program).
 
 /// Bridge member interface request — returned by BRDGGIFS.
@@ -82,16 +91,9 @@ pub struct ifbreq {
     pub _pad: [u8; 32],
 }
 
-/// Bridge interface list config — wrapper for BRDGGIFS ioctl.
-///
-/// ref: `if_bridgevar.h` L232-L240
-/// Total size: 12 bytes (verified). The union contains a single pointer.
-#[repr(C, packed(4))]
-#[derive(Clone, Copy)]
-pub struct ifbifconf {
-    pub ifbic_len: u32,     // buffer size in bytes
-    pub ifbic_buf: *mut u8, // pointer to ifbreq array
-}
+// ifbifconf: ref `if_bridgevar.h` L232-L240, total size 12 bytes.
+// Not constructed directly — `grow_fetch` writes raw bytes matching this
+// layout. Struct definition lives in the test module for offset verification.
 
 /// Bridge address (FDB) entry — returned by BRDGRTS.
 ///
@@ -107,16 +109,9 @@ pub struct ifbareq {
     pub ifba_vlan: u16,                   // VLAN tag
 }
 
-/// Bridge address list config — wrapper for BRDGRTS ioctl.
-///
-/// ref: `if_bridgevar.h` L317-L325
-/// Total size: 12 bytes (verified).
-#[repr(C, packed(4))]
-#[derive(Clone, Copy)]
-pub struct ifbaconf {
-    pub ifbac_len: u32,     // buffer size in bytes
-    pub ifbac_buf: *mut u8, // pointer to ifbareq array
-}
+// ifbaconf: ref `if_bridgevar.h` L317-L325, total size 12 bytes.
+// Not constructed directly — `grow_fetch` writes raw bytes matching this
+// layout. Struct definition lives in the test module for offset verification.
 
 /// Driver-specific ioctl wrapper.
 ///
@@ -131,11 +126,8 @@ pub struct ifdrv {
     pub ifd_data: *mut u8,        // data buffer pointer
 }
 
-// SAFETY: These raw structs are only used for FFI with kernel ioctls.
-// The pointers inside are never shared across threads — they are always
-// stack-local during a single ioctl call.
-unsafe impl Send for ifbifconf {}
-unsafe impl Send for ifbaconf {}
+// SAFETY: ifdrv contains a raw pointer but is only used as a stack-local
+// ioctl argument — never shared across threads.
 unsafe impl Send for ifdrv {}
 
 // ---- Helper functions ----
@@ -183,72 +175,52 @@ pub fn bridge_ioctl_get(fd: RawFd, ifd: &mut ifdrv) -> io::Result<()> {
     Ok(())
 }
 
-/// Two-phase buffer fetch for bridge ioctls that return variable-length data.
+/// Grow-and-retry buffer fetch for bridge ioctls that return variable-length data.
 ///
-/// Phase 1: call with len=0 to get required buffer size.
-/// Phase 2: allocate buffer and call again to get actual data.
+/// Follows the same pattern as `ifconfig`'s `bridge_interfaces` /
+/// `bridge_addresses`: start with an initial buffer, call the ioctl,
+/// and double the buffer if it was too small.
+///
+/// ref: `network_cmds/ifconfig.tproj/ifbridge.c` `bridge_interfaces()` / `bridge_addresses()`
 ///
 /// Both `ifbifconf` and `ifbaconf` share the same packed(4) layout:
-///   offset 0: u32 (buffer length)
+///   offset 0: u32 (buffer length, set by caller, updated by kernel)
 ///   offset 4: *mut u8 (buffer pointer, potentially misaligned for 8-byte ptr)
 ///
-/// `payload_size` must be `size_of::<T>()` for the ioctl config struct.
+/// `entry_size` is `size_of::<ifbreq>()` or `size_of::<ifbareq>()`, used to
+/// detect when the kernel might have more data than the buffer could hold.
+///
 /// We use `write_unaligned` / `read_unaligned` because the pointer field
 /// at offset 4 is only 4-byte aligned in a packed(4) struct.
-pub fn two_phase_fetch(
+pub fn grow_fetch(
     fd: RawFd,
     bridge: &str,
     cmd: libc::c_ulong,
-    payload_size: usize,
+    payload_size: u32,
+    entry_size: u32,
 ) -> io::Result<Vec<u8>> {
     assert!(payload_size >= 12, "payload must hold at least (len: u32, buf: *mut u8)");
 
-    let mut payload = vec![0u8; payload_size];
+    let mut payload = vec![0u8; payload_size as usize];
 
-    // Helper offsets: len at byte 0 (u32), buf_ptr at byte 4 (*mut u8).
+    // Offset 0: u32 len, offset 4: *mut u8 buf.
     let len_off = 0usize;
     let buf_off = 4usize;
 
-    // Phase 1: query required buffer size by passing len=0, buf=null.
-    {
+    // Start with space for ~100 entries (same order as ifconfig's 8192).
+    let mut buf_size: u32 = entry_size * 100;
+
+    loop {
+        let mut data_buf = vec![0u8; buf_size as usize];
+
         // SAFETY: `payload` is valid for `payload_size` bytes. We write a u32
-        // at offset 0 (always aligned) and a pointer at offset 4 (potentially
-        // only 4-byte aligned, hence write_unaligned).
-        unsafe {
-            std::ptr::write_unaligned(payload.as_mut_ptr().add(len_off).cast::<u32>(), 0);
-            std::ptr::write_unaligned(
-                payload.as_mut_ptr().add(buf_off).cast::<*mut u8>(),
-                std::ptr::null_mut(),
-            );
-        }
-
-        let mut ifd: ifdrv = unsafe { std::mem::zeroed() };
-        write_ifname(&mut ifd.ifd_name, bridge);
-        ifd.ifd_cmd = cmd;
-        ifd.ifd_len = payload_size;
-        ifd.ifd_data = payload.as_mut_ptr();
-
-        bridge_ioctl_get(fd, &mut ifd)?;
-    }
-
-    // Read back the required length the kernel wrote into the payload.
-    // SAFETY: kernel just wrote into payload at offset 0 (u32, aligned).
-    let required_len =
-        unsafe { std::ptr::read_unaligned(payload.as_ptr().add(len_off).cast::<u32>()) };
-
-    if required_len == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Phase 2: allocate buffer and fetch actual data.
-    let mut data_buf = vec![0u8; required_len as usize];
-    {
-        // SAFETY: same as phase 1 — writing len and buf pointer into payload.
-        // data_buf is valid for required_len bytes and lives until after the ioctl.
+        // at offset 0 and a pointer at offset 4 (only 4-byte aligned in
+        // packed(4), hence write_unaligned).
+        // `data_buf` lives until after the ioctl returns.
         unsafe {
             std::ptr::write_unaligned(
                 payload.as_mut_ptr().add(len_off).cast::<u32>(),
-                required_len,
+                buf_size,
             );
             std::ptr::write_unaligned(
                 payload.as_mut_ptr().add(buf_off).cast::<*mut u8>(),
@@ -259,25 +231,55 @@ pub fn two_phase_fetch(
         let mut ifd: ifdrv = unsafe { std::mem::zeroed() };
         write_ifname(&mut ifd.ifd_name, bridge);
         ifd.ifd_cmd = cmd;
-        ifd.ifd_len = payload_size;
+        ifd.ifd_len = payload_size as usize;
         ifd.ifd_data = payload.as_mut_ptr();
 
         bridge_ioctl_get(fd, &mut ifd)?;
-    }
 
-    Ok(data_buf)
+        // SAFETY: kernel wrote the actual filled length back at offset 0.
+        let filled_len =
+            unsafe { std::ptr::read_unaligned(payload.as_ptr().add(len_off).cast::<u32>()) };
+
+        // If filled_len + one entry >= buffer size, the kernel might have
+        // truncated. Double and retry (same heuristic as ifconfig).
+        if filled_len + entry_size >= buf_size {
+            buf_size *= 2;
+            continue;
+        }
+
+        data_buf.truncate(filled_len as usize);
+        return Ok(data_buf);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Test-only struct definitions for layout verification.
+    // These mirror the kernel's ifbifconf/ifbaconf but are never constructed
+    // in production — grow_fetch writes matching raw bytes instead.
+
+    /// ref: `if_bridgevar.h` L232-L240
+    #[repr(C, packed(4))]
+    struct ifbifconf {
+        ifbic_len: u32,
+        ifbic_buf: *mut u8,
+    }
+
+    /// ref: `if_bridgevar.h` L317-L325
+    #[repr(C, packed(4))]
+    struct ifbaconf {
+        ifbac_len: u32,
+        ifbac_buf: *mut u8,
+    }
+
     #[test]
     fn struct_sizes() {
-        assert_eq!(size_of::<ifbreq>(), 80);
-        assert_eq!(size_of::<ifbareq>(), 36);
-        assert_eq!(size_of::<ifbifconf>(), 12);
-        assert_eq!(size_of::<ifbaconf>(), 12);
+        assert_eq!(size_of::<ifbreq>(), IFBREQ_SIZE as usize);
+        assert_eq!(size_of::<ifbareq>(), IFBAREQ_SIZE as usize);
+        assert_eq!(size_of::<ifbifconf>(), IFBIFCONF_SIZE as usize);
+        assert_eq!(size_of::<ifbaconf>(), IFBACONF_SIZE as usize);
         assert_eq!(size_of::<ifdrv>(), 40);
     }
 

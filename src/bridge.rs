@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::enumerate::list_bridges;
 use crate::flags::{BridgeEntryFlags, BridgeMemberFlags};
 use crate::mac::MacAddr;
-use crate::sys::{self, ifbaconf, ifbareq, ifbifconf, ifbreq};
+use crate::sys::{self, ifbareq, ifbreq};
 use crate::util::{cstr_from_buf, validate_bridge_name};
 
 /// A member interface of a bridge.
@@ -45,7 +45,13 @@ pub fn list_members(bridge: &str) -> io::Result<Vec<BridgeMember>> {
 }
 
 fn list_members_inner(fd: i32, bridge: &str) -> io::Result<Vec<BridgeMember>> {
-    let data = sys::two_phase_fetch(fd, bridge, sys::BRDGGIFS, size_of::<ifbifconf>())?;
+    let data = sys::grow_fetch(
+        fd,
+        bridge,
+        sys::BRDGGIFS,
+        sys::IFBIFCONF_SIZE,
+        sys::IFBREQ_SIZE,
+    )?;
 
     if data.is_empty() {
         return Ok(Vec::new());
@@ -95,7 +101,13 @@ pub fn list_fdb(bridge: &str) -> io::Result<Vec<BridgeEntry>> {
 }
 
 fn list_fdb_inner(fd: i32, bridge: &str) -> io::Result<Vec<BridgeEntry>> {
-    let data = sys::two_phase_fetch(fd, bridge, sys::BRDGRTS, size_of::<ifbaconf>())?;
+    let data = sys::grow_fetch(
+        fd,
+        bridge,
+        sys::BRDGRTS,
+        sys::IFBACONF_SIZE,
+        sys::IFBAREQ_SIZE,
+    )?;
 
     if data.is_empty() {
         return Ok(Vec::new());
