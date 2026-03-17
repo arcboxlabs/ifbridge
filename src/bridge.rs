@@ -23,8 +23,10 @@ pub struct BridgeEntry {
     pub flags: BridgeEntryFlags,
     /// Remaining time before this entry expires.
     ///
-    /// `None` if the entry is static or the kernel returned 0.
-    /// The exact semantics are kernel-version-dependent.
+    /// `None` when the kernel returned 0 — this covers both static entries
+    /// and entries whose expire counter has reached zero. Check
+    /// [`flags.is_static()`](BridgeEntryFlags::is_static) to distinguish.
+    /// The exact semantics of the expire value are kernel-version-dependent.
     pub expires_in: Option<Duration>,
 }
 
@@ -58,6 +60,17 @@ fn list_members_inner(fd: i32, bridge: &str) -> io::Result<Vec<BridgeMember>> {
     }
 
     let entry_size = size_of::<ifbreq>();
+    if data.len() % entry_size != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BRDGGIFS returned {} bytes, not a multiple of ifbreq size ({}); \
+                 possible ABI mismatch with this macOS version",
+                data.len(),
+                entry_size,
+            ),
+        ));
+    }
     let count = data.len() / entry_size;
     let mut members = Vec::with_capacity(count);
 
@@ -114,6 +127,17 @@ fn list_fdb_inner(fd: i32, bridge: &str) -> io::Result<Vec<BridgeEntry>> {
     }
 
     let entry_size = size_of::<ifbareq>();
+    if data.len() % entry_size != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BRDGRTS returned {} bytes, not a multiple of ifbareq size ({}); \
+                 possible ABI mismatch with this macOS version",
+                data.len(),
+                entry_size,
+            ),
+        ));
+    }
     let count = data.len() / entry_size;
     let mut entries = Vec::with_capacity(count);
 

@@ -41,6 +41,13 @@ pub fn validate_bridge_name(name: &str) -> io::Result<()> {
         ));
     }
 
+    if name.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name contains embedded NUL byte",
+        ));
+    }
+
     Ok(())
 }
 
@@ -75,6 +82,11 @@ mod tests {
         assert!(validate_bridge_name("en0").is_err());
         assert!(validate_bridge_name("lo0").is_err());
         assert!(validate_bridge_name("vmenet0").is_err());
+    }
+
+    #[test]
+    fn rejects_embedded_nul() {
+        assert!(validate_bridge_name("bridge0\0junk").is_err());
     }
 
     #[test]

@@ -35,7 +35,8 @@ fn main() {
                 for e in &entries {
                     let expire = match e.expires_in {
                         Some(d) => format!("{}s", d.as_secs()),
-                        None => "static".to_string(),
+                        None if e.flags.is_static() => "static".to_string(),
+                        None => "0".to_string(),
                     };
                     println!(
                         "    {} on {} vlan={} flags={:?} expire={}",
