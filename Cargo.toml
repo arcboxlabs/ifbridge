@@ -1,6 +1,6 @@
 [package]
 name = "ifbridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "macOS-only typed access to bridge(4) forwarding database via private ioctls"
 license = "MIT OR Apache-2.0"
